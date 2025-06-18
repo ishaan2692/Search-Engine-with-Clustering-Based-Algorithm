@@ -1,0 +1,10 @@
+streamlit 
+requests 
+beautifulsoup4 
+pandas 
+numpy 
+scikit-learn 
+matplotlib 
+seaborn 
+sentence-transformers 
+umap-learn
