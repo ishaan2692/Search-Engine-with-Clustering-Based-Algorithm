@@ -13,20 +13,21 @@ import random
 import concurrent.futures
 from sklearn.cluster import DBSCAN
 from sklearn.manifold import TSNE
-from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sentence_transformers import SentenceTransformer
 import umap
+from datetime import datetime
 
-# Initialize SQLite database
+# Initialize SQLite database with storage management
 conn = sqlite3.connect('electronics_products.db')
 c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS products
              (id TEXT PRIMARY KEY, title TEXT, description TEXT, 
               price REAL, url TEXT, image BLOB, category TEXT, 
-              brand TEXT, specs TEXT)''')
+              brand TEXT, specs TEXT, relevance_score REAL, 
+              last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 conn.commit()
 
 # Electronics sites with high success rates
@@ -44,30 +45,34 @@ def load_model():
 
 model = load_model()
 
-# Electronics product schema
+# Advanced product schema with multiple fallbacks
 PRODUCT_SCHEMA = {
     'title': [
         'h1.product-title', 'h1.product-name', 'h1.title', 
-        '[data-test="product-title"]', 'h1', 'span#productTitle'
+        '[data-test="product-title"]', 'h1', 'span#productTitle',
+        'h1.product-name', 'h1.product-title', 'h1.page-title'
     ],
     'description': [
         '.product-description', '.description-content', 
         '#product-overview', '[data-feature-name="productDescription"]',
-        '#feature-bullets', '.product-information'
+        '#feature-bullets', '.product-information',
+        'div#productDescription', 'div.description', 'div.details'
     ],
     'price': [
         '.price', '.priceView-hero-price', '.price-current', 
         '[data-test="product-price"]', 'span.a-price-whole',
-        '.priceView-customer-price'
+        '.priceView-customer-price', 'span.price-characteristic',
+        'span.price-item', 'div.price', 'div.pricing'
     ],
     'image': [
         'img.product-image', 'img.primary-image', 
         '[data-test="product-gallery-image"]', 'img#landingImage',
-        '.primary-image'
+        '.primary-image', 'img.main-image', 'img#main-image'
     ],
     'specs': [
         '.specifications', '.specs-table', '#product-details',
-        '.spec-container', 'div#technicalSpecifications_section'
+        '.spec-container', 'div#technicalSpecifications_section',
+        'table.specs', 'div.spec-list', 'div.tech-specs'
     ]
 }
 
@@ -80,9 +85,9 @@ USER_AGENTS = [
 ]
 
 # Streamlit app
-st.set_page_config(page_title="TechCluster", layout="wide")
-st.title("🧠 Smart Electronics Search with ML Clustering")
-st.markdown("Discover electronics products grouped by AI-powered similarity clusters")
+st.set_page_config(page_title="TechSearch Pro", layout="wide")
+st.title("🔍 Advanced Electronics Search with Smart Storage")
+st.markdown("Sophisticated scraping with intelligent storage management (max 100 products)")
 
 # Functions
 def safe_get(soup, selectors):
@@ -103,29 +108,44 @@ def get_random_headers():
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Referer': 'https://www.google.com/',
-        'DNT': '1'
+        'DNT': '1',
+        'Accept-Encoding': 'gzip, deflate, br'
     }
 
-def crawl_site(url, depth=1):
-    visited = set()
+def extract_with_retry(soup, selectors, retries=3):
+    """Robust extraction with multiple attempts and selectors"""
+    for _ in range(retries):
+        result = safe_get(soup, selectors)
+        if result:
+            return result
+        time.sleep(0.5)
+    return ''
+
+def crawl_site(url, max_products=100):
+    """Advanced crawling with pagination and comprehensive product discovery"""
+    base_domain = url.split('//')[-1].split('/')[0]
+    product_links = set()
+    visited_pages = set()
     to_visit = [url]
-    product_links = []
     
-    while to_visit and depth > 0:
+    while to_visit and len(product_links) < max_products:
         current_url = to_visit.pop(0)
-        if current_url in visited:
+        if current_url in visited_pages:
             continue
-            
+        
         try:
             headers = get_random_headers()
-            response = requests.get(current_url, headers=headers, timeout=20)
+            response = requests.get(current_url, headers=headers, timeout=25)
             if response.status_code != 200:
                 continue
                 
             soup = BeautifulSoup(response.text, 'html.parser')
-            visited.add(current_url)
+            visited_pages.add(current_url)
             
-            # Find product links
+            # Find product links using multiple strategies
+            link_candidates = set()
+            
+            # Strategy 1: Direct product links
             for link in soup.find_all('a', href=True):
                 href = link['href']
                 if not href or href.startswith(('javascript:', 'mailto:', 'tel:')):
@@ -134,53 +154,135 @@ def crawl_site(url, depth=1):
                 full_url = requests.compat.urljoin(current_url, href)
                 
                 # Match electronics product URL patterns
-                if any(pat in full_url for pat in ['/p/', '/product/', '/prodid/', '/item/', '/dp/']):
-                    if full_url not in product_links and not any(x in full_url for x in ['cart', 'checkout', 'account']):
-                        product_links.append(full_url)
-                elif depth > 1 and full_url.startswith(url) and '#' not in full_url:
-                    to_visit.append(full_url)
+                if any(pat in full_url for pat in ['/p/', '/product/', '/prodid/', '/item/', '/dp/', '-product-']):
+                    if base_domain in full_url and not any(x in full_url for x in ['cart', 'checkout', 'account']):
+                        link_candidates.add(full_url)
             
-            depth -= 1
-            time.sleep(random.uniform(0.8, 1.8))
+            # Strategy 2: JSON-LD product data
+            try:
+                json_ld = soup.find('script', type='application/ld+json')
+                if json_ld:
+                    import json
+                    data = json.loads(json_ld.string)
+                    if isinstance(data, list):
+                        data = data[0]
+                    if data.get('@type') == 'Product' and data.get('url'):
+                        product_url = data['url']
+                        if base_domain in product_url:
+                            link_candidates.add(product_url)
+            except:
+                pass
+            
+            # Strategy 3: Meta tags
+            og_url = soup.find('meta', property='og:url')
+            if og_url and og_url.get('content') and base_domain in og_url['content']:
+                link_candidates.add(og_url['content'])
+            
+            # Add valid candidates to product links
+            for link in link_candidates:
+                if len(product_links) < max_products:
+                    product_links.add(link)
+            
+            # Find next page for pagination
+            next_page = None
+            # Method 1: Link with rel="next"
+            next_link = soup.find('link', rel='next')
+            if next_link and next_link.get('href'):
+                next_page = requests.compat.urljoin(current_url, next_link['href'])
+            
+            # Method 2: Common pagination patterns
+            if not next_page:
+                pagination_selectors = [
+                    'a.next', 'a.pagination-next', 'li.next a', 
+                    'a:contains("Next")', 'a:contains("›")', 'a:contains(">")'
+                ]
+                for selector in pagination_selectors:
+                    next_btn = soup.select_one(selector)
+                    if next_btn and next_btn.get('href'):
+                        next_page = requests.compat.urljoin(current_url, next_btn['href'])
+                        break
+            
+            # Add next page to visit
+            if next_page and next_page not in visited_pages:
+                to_visit.append(next_page)
+            
+            # Random delay to avoid detection
+            time.sleep(random.uniform(1.0, 3.0))
             
         except Exception as e:
             st.warning(f"Error crawling {current_url}: {str(e)}")
     
-    return list(set(product_links))
+    return list(product_links)[:max_products]
 
 def extract_specs(soup):
-    """Extract technical specifications as key-value pairs"""
+    """Advanced technical specification extraction"""
     specs = {}
     try:
-        # Try to find specification tables
-        tables = soup.select('table.specs-table, table.spec-table')
+        # Try specification tables
+        tables = soup.select('table.specs-table, table.spec-table, table.specs')
         for table in tables:
             rows = table.find_all('tr')
             for row in rows:
                 cells = row.find_all(['th', 'td'])
                 if len(cells) == 2:
-                    key = cells[0].get_text(strip=True)
+                    key = cells[0].get_text(strip=True).replace(':', '')
                     value = cells[1].get_text(strip=True)
-                    specs[key] = value
+                    if key and value:
+                        specs[key] = value
         
-        # Try to find specification lists
-        spec_lists = soup.select('div.spec-container, div.spec-list')
+        # Try specification lists
+        spec_lists = soup.select('div.spec-container, div.spec-list, ul.specs')
         for spec_list in spec_lists:
             items = spec_list.find_all(['li', 'div.spec-item'])
             for item in items:
-                if ':' in item.text:
-                    key, value = item.text.split(':', 1)
-                    specs[key.strip()] = value.strip()
+                text = item.get_text(strip=True)
+                if ':' in text:
+                    key, value = text.split(':', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key and value:
+                        specs[key] = value
+        
+        # Try JSON-LD specifications
+        json_ld = soup.find('script', type='application/ld+json')
+        if json_ld:
+            try:
+                import json
+                data = json.loads(json_ld.string)
+                if isinstance(data, list):
+                    data = data[0]
+                if data.get('@type') == 'Product':
+                    # Extract from product schema
+                    for prop in ['processor', 'ram', 'storage', 'display', 'graphics']:
+                        if prop in data:
+                            specs[prop.capitalize()] = data[prop]
+                    if 'additionalProperty' in data:
+                        for prop in data['additionalProperty']:
+                            if 'name' in prop and 'value' in prop:
+                                specs[prop['name']] = prop['value']
+            except:
+                pass
     
     except Exception as e:
         st.warning(f"Error extracting specs: {str(e)}")
     
-    return str(specs)  # Convert to string for storage
+    return str(specs)
+
+def calculate_relevance_score(product):
+    """Calculate relevance score based on completeness of data"""
+    score = 0
+    if product.get('title'): score += 25
+    if product.get('description'): score += 20
+    if product.get('price') and product['price'] > 0: score += 20
+    if product.get('image'): score += 15
+    if product.get('specs') and len(product['specs']) > 20: score += 10
+    if product.get('category') != "Other": score += 10
+    return score
 
 def scrape_product(url):
     try:
         headers = get_random_headers()
-        response = requests.get(url, headers=headers, timeout=25)
+        response = requests.get(url, headers=headers, timeout=30)  # Extended timeout
         if response.status_code != 200:
             return None
             
@@ -188,7 +290,7 @@ def scrape_product(url):
         
         product = {'url': url}
         for key, selectors in PRODUCT_SCHEMA.items():
-            product[key] = safe_get(soup, selectors)
+            product[key] = extract_with_retry(soup, selectors)
         
         # Price extraction
         if product['price']:
@@ -230,24 +332,19 @@ def scrape_product(url):
         # Extract technical specifications
         product['specs'] = extract_specs(soup)
         
+        # Calculate relevance score
+        product['relevance_score'] = calculate_relevance_score(product)
+        
         # Image handling
         img_data = b''
         if product['image'] and product['image'].startswith('http'):
             try:
-                img_response = requests.get(product['image'], headers=headers, timeout=15)
+                img_response = requests.get(product['image'], headers=headers, timeout=20)
                 if img_response.status_code == 200:
                     img_data = img_response.content
             except:
                 pass
-        
-        # Create unique ID
-        url_hash = hashlib.sha256(url.encode()).hexdigest()
-        
-        # Save to DB
-        c.execute('''INSERT OR IGNORE INTO products VALUES (?,?,?,?,?,?,?,?,?)''',
-                  (url_hash, product.get('title', ''), product.get('description', ''),
-                   product.get('price', 0), url, img_data, category, brand, product.get('specs', '')))
-        conn.commit()
+        product['image'] = img_data
         
         return product
     
@@ -255,109 +352,47 @@ def scrape_product(url):
         st.warning(f"Error scraping {url}: {str(e)}")
         return None
 
-def scrape_with_retry(url, retries=3):
-    for attempt in range(retries):
-        try:
-            return scrape_product(url)
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
-            wait_time = (attempt + 1) * 6
-            time.sleep(wait_time)
-            continue
-        except Exception as e:
-            st.warning(f"Error on attempt {attempt+1} for {url}: {str(e)}")
-            time.sleep(3)
+def manage_storage(conn, new_product_ids):
+    """Advanced storage management to maintain 100 highest-quality products"""
+    c = conn.cursor()
     
-    st.warning(f"Failed to scrape {url} after {retries} retries")
-    return None
-
-def generate_embeddings(df):
-    """Generate BERT embeddings for product text data"""
-    texts = df['title'] + " " + df['description'] + " " + df['specs']
-    embeddings = model.encode(texts.tolist(), show_progress_bar=False)
-    return embeddings
-
-def cluster_products(df, embeddings):
-    """Cluster products using DBSCAN algorithm"""
-    # Reduce dimensionality with UMAP
-    reducer = umap.UMAP(n_components=5, random_state=42)
-    reduced_embeddings = reducer.fit_transform(embeddings)
+    # Get current count
+    c.execute("SELECT COUNT(*) FROM products")
+    current_count = c.fetchone()[0]
     
-    # Standardize features
-    scaler = StandardScaler()
-    scaled_embeddings = scaler.fit_transform(reduced_embeddings)
+    # If under limit, just add new products
+    if current_count + len(new_product_ids) <= 100:
+        return
     
-    # Apply DBSCAN clustering
-    dbscan = DBSCAN(eps=0.5, min_samples=5)
-    clusters = dbscan.fit_predict(scaled_embeddings)
+    # Get all products with relevance scores
+    c.execute("SELECT id, relevance_score, last_updated FROM products")
+    all_products = c.fetchall()
     
-    # Add clusters to dataframe
-    df['cluster'] = clusters
+    # Create dataframe for sorting
+    df = pd.DataFrame(all_products, columns=['id', 'relevance_score', 'last_updated'])
     
-    # Calculate cluster centers
-    cluster_centers = []
-    for cluster_id in np.unique(clusters):
-        if cluster_id == -1:  # Skip noise points
-            continue
-        cluster_points = scaled_embeddings[clusters == cluster_id]
-        cluster_center = np.mean(cluster_points, axis=0)
-        cluster_centers.append(cluster_center)
+    # Calculate retention score (70% relevance + 30% recency)
+    df['recency_score'] = (pd.to_datetime(df['last_updated']) - pd.Timestamp('1970-01-01')).dt.total_seconds()
+    max_recency = df['recency_score'].max()
+    min_recency = df['recency_score'].min()
     
-    return df, cluster_centers, scaled_embeddings
-
-def visualize_clusters(df, embeddings):
-    """Create visualization of product clusters"""
-    # Reduce to 2D for visualization
-    tsne = TSNE(n_components=2, random_state=42)
-    vis_embeddings = tsne.fit_transform(embeddings)
+    if max_recency > min_recency:
+        df['recency_normalized'] = (df['recency_score'] - min_recency) / (max_recency - min_recency)
+    else:
+        df['recency_normalized'] = 1.0
     
-    df['x'] = vis_embeddings[:, 0]
-    df['y'] = vis_embeddings[:, 1]
+    df['retention_score'] = 0.7 * df['relevance_score'] + 0.3 * df['recency_normalized'] * 100
     
-    # Create plot
-    plt.figure(figsize=(12, 8))
-    scatter = sns.scatterplot(
-        data=df, x='x', y='y', hue='cluster', 
-        palette='viridis', style='category', s=100
-    )
+    # Sort by retention score (descending)
+    df = df.sort_values('retention_score', ascending=False)
     
-    plt.title("Electronics Product Clusters")
-    plt.xlabel("TSNE Dimension 1")
-    plt.ylabel("TSNE Dimension 2")
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.tight_layout()
+    # Determine which products to keep
+    keep_ids = df.head(100)['id'].tolist()
     
-    return plt
-
-def search_products(query, df, embeddings, top_k=10):
-    """Find most relevant products using cluster-based search"""
-    # Generate query embedding
-    query_embedding = model.encode([query])[0]
-    
-    # Find most relevant clusters
-    cluster_similarities = []
-    for center in st.session_state.cluster_centers:
-        similarity = np.dot(query_embedding, center) / (
-            np.linalg.norm(query_embedding) * np.linalg.norm(center))
-        cluster_similarities.append(similarity)
-    
-    # Get top clusters
-    top_cluster_ids = np.argsort(cluster_similarities)[-3:][::-1]
-    
-    # Get products from top clusters
-    cluster_products = df[df['cluster'].isin(top_cluster_ids)]
-    
-    # Calculate similarities within these clusters
-    product_embeddings = embeddings[cluster_products.index]
-    similarities = np.dot(product_embeddings, query_embedding) / (
-        np.linalg.norm(product_embeddings, axis=1) * np.linalg.norm(query_embedding))
-    
-    # Add similarities to dataframe
-    cluster_products['similarity'] = similarities
-    
-    # Get top products
-    results = cluster_products.sort_values('similarity', ascending=False).head(top_k)
-    
-    return results
+    # Delete products not in the keep list
+    placeholders = ','.join(['?'] * len(keep_ids))
+    c.execute(f"DELETE FROM products WHERE id NOT IN ({placeholders})", keep_ids)
+    conn.commit()
 
 # Initialize session state
 if 'df' not in st.session_state:
@@ -372,11 +407,12 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     
     if st.button("🔄 Refresh Database", key="refresh_db"):
+        new_product_ids = []
         all_products = []
         for site in ELECTRONICS_SITES:
             with st.spinner(f"Crawling {site.split('//')[-1].split('/')[0]}..."):
                 try:
-                    product_links = crawl_site(site, depth=1)
+                    product_links = crawl_site(site, max_products=25)
                     st.info(f"Found {len(product_links)} product links")
                     
                     if not product_links:
@@ -386,17 +422,31 @@ with st.sidebar:
                     scraped_count = 0
                     
                     # Use threading for faster scraping
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-                        futures = {executor.submit(scrape_with_retry, url): url for url in product_links}
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                        futures = {executor.submit(scrape_product, url): url for url in product_links}
                         
                         for i, future in enumerate(concurrent.futures.as_completed(futures)):
                             try:
                                 product = future.result()
                                 if product:
+                                    # Create unique ID
+                                    url_hash = hashlib.sha256(product['url'].encode()).hexdigest()
+                                    
+                                    # Save to DB
+                                    c.execute('''INSERT OR REPLACE INTO products 
+                                              (id, title, description, price, url, image, category, brand, specs, relevance_score) 
+                                              VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                                              (url_hash, product.get('title', ''), product.get('description', ''),
+                                              product.get('price', 0), product['url'], product.get('image', b''), 
+                                              product.get('category', 'Other'), product.get('brand', 'Unknown'),
+                                              product.get('specs', ''), product.get('relevance_score', 0)))
+                                    conn.commit()
+                                    
+                                    new_product_ids.append(url_hash)
                                     all_products.append(product)
                                     scraped_count += 1
                             except Exception as e:
-                                pass
+                                st.warning(f"Error processing product: {str(e)}")
                             
                             progress_bar.progress((i + 1) / len(product_links))
                     
@@ -405,108 +455,23 @@ with st.sidebar:
                     st.error(f"Error processing site: {str(e)}")
         
         if all_products:
-            st.balloons()
-            st.success(f"✅ Total added: {len(all_products)} products")
+            # Manage storage to keep only 100 best products
+            manage_storage(conn, new_product_ids)
             
-            # Generate embeddings and clusters after refresh
-            with st.spinner("Generating embeddings and clusters..."):
+            # Load data for clustering
+            with st.spinner("Preparing data for clustering..."):
                 c.execute("SELECT * FROM products")
                 products = c.fetchall()
-                st.session_state.df = pd.DataFrame(products, columns=[
-                    'id','title','description','price','url','image',
-                    'category','brand','specs'
-                ])
-                st.session_state.embeddings = generate_embeddings(st.session_state.df)
-                st.session_state.df, st.session_state.cluster_centers, scaled_embeddings = cluster_products(
-                    st.session_state.df, st.session_state.embeddings
-                )
-                st.success("Clusters generated!")
-        else:
-            st.warning("No products were added to the database")
-    
-    if st.button("🧹 Clear Database", key="clear_db"):
-        c.execute("DELETE FROM products")
-        conn.commit()
-        st.session_state.df = pd.DataFrame()
-        st.session_state.embeddings = np.array([])
-        st.session_state.cluster_centers = []
-        st.success("Database cleared!")
-    
-    st.divider()
-    
-    if not st.session_state.df.empty:
-        st.info("📊 Cluster Analysis")
-        cluster_counts = st.session_state.df['cluster'].value_counts()
-        st.write(f"**Total Clusters:** {len(cluster_counts)}")
-        st.write(f"**Products in Clusters:** {len(st.session_state.df[st.session_state.df['cluster'] != -1])}")
-        st.write(f"**Noise Points:** {len(st.session_state.df[st.session_state.df['cluster'] == -1])}")
-        
-        st.divider()
-        
-        st.info("🔍 Top Clusters by Size")
-        for cluster_id, count in cluster_counts.head(5).items():
-            if cluster_id != -1:
-                cluster_category = st.session_state.df[st.session_state.df['cluster'] == cluster_id]['category'].mode()[0]
-                st.write(f"**Cluster {cluster_id}**: {count} products ({cluster_category})")
-    
-    st.divider()
-    st.info("📦 Database Stats:")
-    c.execute("SELECT COUNT(*) FROM products")
-    count = c.fetchone()[0]
-    st.write(f"**Products:** {count}")
-    
-    if count > 0:
-        c.execute("SELECT category, COUNT(*) FROM products GROUP BY category")
-        for row in c.fetchall():
-            st.write(f"- **{row[0]}**: {row[1]}")
-    
-    st.divider()
-    st.caption("ℹ️ Note: Scraping real e-commerce sites. Use responsibly.")
-
-# Main interface
-st.header("🔍 Intelligent Electronics Search")
-
-# Display cluster visualization
-if not st.session_state.df.empty and len(st.session_state.df) > 10:
-    with st.expander("📊 Product Cluster Visualization", expanded=True):
-        st.write("This visualization shows how our AI has grouped similar electronics products:")
-        fig = visualize_clusters(st.session_state.df.copy(), st.session_state.embeddings)
-        st.pyplot(fig)
-        st.caption("Each point represents a product, colored by its cluster. Products in the same cluster have similar features.")
-
-# Search section
-search_query = st.text_input("Search electronics products:", 
-                             placeholder="Gaming laptops, wireless headphones, 4K cameras...",
-                             key="search_input")
-
-# Search options
-if not st.session_state.df.empty:
-    col1, col2 = st.columns(2)
-    with col1:
-        categories = st.session_state.df['category'].unique().tolist()
-        selected_category = st.selectbox("Filter by category:", ["All"] + categories)
-    with col2:
-        brands = st.session_state.df['brand'].unique().tolist()
-        selected_brand = st.selectbox("Filter by brand:", ["All"] + brands)
-
-# Price range filter
-if not st.session_state.df.empty:
-    min_price = st.session_state.df['price'].min()
-    max_price = st.session_state.df['price'].max()
-    price_range = st.slider("Price range:", min_value=min_price, max_value=max_price, 
-                            value=(min_price, max_price))
-
-# Search button
-if st.button("Search", key="search_btn") or search_query:
-    if not st.session_state.df.empty and st.session_state.embeddings.size > 0:
-        with st.spinner("Finding the best electronics products using AI clustering..."):
-            results = search_products(search_query, st.session_state.df, st.session_state.embeddings, top_k=12)
-            
-            if results.empty:
-                st.warning("No matching products found. Try a different search term.")
-                st.stop()
-            
-            # Apply filters
-            if selected_category != "All":
-                results = results[results['category'] == selected_category]
-         
+                if products:
+                    st.session_state.df = pd.DataFrame(products, columns=[
+                        'id','title','description','price','url','image',
+                        'category','brand','specs','relevance_score','last_updated'
+                    ])
+                    
+                    # Generate embeddings
+                    st.session_state.df['text_data'] = st.session_state.df['title'] + " " + st.session_state.df['description'] + " " + st.session_state.df['specs']
+                    st.session_state.embeddings = model.encode(st.session_state.df['text_data'].tolist(), show_progress_bar=False)
+                    
+                    # Generate clusters
+                    reducer = umap.UMAP(n_components=5, random_state=42)
+                    reduced_embeddings = reducer.fit_transform(st.session_state.embed
